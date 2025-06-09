@@ -1,7 +1,10 @@
 import json
 import os
+import tempfile
 from dataclasses import asdict
 from typing import BinaryIO, TextIO
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import ffmpeg
 import numpy as np
@@ -125,3 +128,34 @@ def load_audio(file: BinaryIO, encode=True, sr: int = CONFIG.SAMPLE_RATE):
         out = file.read()
 
     return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+
+
+def download_audio_from_url(url: str) -> BinaryIO:
+    """
+    Download audio file from URL and return as a file-like object.
+    
+    Parameters
+    ----------
+    url: str
+        The URL to download the audio file from
+        
+    Returns
+    -------
+    A file-like object containing the downloaded audio data
+    """
+    try:
+        # Validate URL
+        parsed_url = urlparse(url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            raise ValueError("Invalid URL provided")
+        
+        # Download the file
+        with urlopen(url) as response:
+            # Create a temporary file to store the downloaded audio
+            temp_file = tempfile.NamedTemporaryFile(delete=False)
+            temp_file.write(response.read())
+            temp_file.seek(0)  # Reset file pointer to beginning
+            return temp_file
+            
+    except Exception as e:
+        raise RuntimeError(f"Failed to download audio from URL: {str(e)}") from e

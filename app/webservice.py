@@ -1,4 +1,3 @@
-import importlib.metadata
 import os
 from os import path
 from typing import Annotated, Optional, Union
@@ -6,7 +5,7 @@ from urllib.parse import quote
 
 import click
 import uvicorn
-from fastapi import FastAPI, File, Query, UploadFile, applications
+from fastapi import FastAPI, File, Query, UploadFile, applications, HTTPException
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,21 +13,20 @@ from whisper import tokenizer
 
 from app.config import CONFIG
 from app.factory.asr_model_factory import ASRModelFactory
-from app.utils import load_audio
+from app.utils import load_audio, download_audio_from_url
 
 asr_model = ASRModelFactory.create_asr_model()
 asr_model.load_model()
 
 LANGUAGE_CODES = sorted(tokenizer.LANGUAGES.keys())
 
-projectMetadata = importlib.metadata.metadata("whisper-asr-webservice")
 app = FastAPI(
-    title=projectMetadata["Name"].title().replace("-", " "),
-    description=projectMetadata["Summary"],
-    version=projectMetadata["Version"],
-    contact={"url": projectMetadata["Home-page"]},
+    title="Whisper ASR Webservice",
+    description="Whisper ASR Webservice",
+    version="0.0.0",
+    contact={"url": "https://github.com/ControlNet/whisper-asr-webservice"},
     swagger_ui_parameters={"defaultModelsExpandDepth": -1},
-    license_info={"name": "MIT License", "url": projectMetadata["License"]},
+    license_info={"name": "MIT License", "url": "https://github.com/ControlNet/whisper-asr-webservice/blob/main/LICENSE"},
 )
 
 assets_path = os.getcwd() + "/swagger-ui-assets"
@@ -54,7 +52,8 @@ async def index():
 
 @app.post("/asr", tags=["Endpoints"])
 async def asr(
-    audio_file: UploadFile = File(...),  # noqa: B008
+    audio_file: Optional[UploadFile] = File(None, description="Audio file to transcribe"),
+    audio_url: Optional[str] = Query(None, description="URL to download audio file from"),
     encode: bool = Query(default=True, description="Encode audio first through ffmpeg"),
     task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
     language: Union[str, None] = Query(default=None, enum=LANGUAGE_CODES),
@@ -88,10 +87,47 @@ async def asr(
     ),
     output: Union[str, None] = Query(default="txt", enum=["txt", "vtt", "srt", "tsv", "json"]),
 ):
+    # Validate that either audio_file or audio_url is provided, but not both
+    if not audio_file and not audio_url:
+        raise HTTPException(
+            status_code=400, 
+            detail="Either audio_file or audio_url must be provided"
+        )
+    
+    if audio_file and audio_url:
+        raise HTTPException(
+            status_code=400, 
+            detail="Cannot provide both audio_file and audio_url. Choose one."
+        )
+    
+    # Handle audio input based on source
+    if audio_url:
+        try:
+            # Download audio from URL
+            downloaded_file = download_audio_from_url(audio_url)
+            audio_data = load_audio(downloaded_file, encode)
+            # Extract filename from URL for response headers
+            filename = audio_url.split('/')[-1] or "downloaded_audio"
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to process audio URL: {str(e)}")
+        finally:
+            # Clean up temporary file if it exists
+            if 'downloaded_file' in locals():
+                try:
+                    downloaded_file.close()
+                    import os
+                    os.unlink(downloaded_file.name)
+                except:
+                    pass
+    else:
+        # Handle uploaded file
+        audio_data = load_audio(audio_file.file, encode)
+        filename = audio_file.filename
+
     result = asr_model.transcribe(
-        load_audio(audio_file.file, encode),
+        audio_data,
         task,
-        language,
+        language if language != "auto" else None,
         initial_prompt,
         vad_filter,
         word_timestamps,
@@ -103,17 +139,52 @@ async def asr(
         media_type="text/plain",
         headers={
             "Asr-Engine": CONFIG.ASR_ENGINE,
-            "Content-Disposition": f'attachment; filename="{quote(audio_file.filename)}.{output}"',
+            "Content-Disposition": f'attachment; filename="{quote(filename)}.{output}"',
         },
     )
 
 
 @app.post("/detect-language", tags=["Endpoints"])
 async def detect_language(
-    audio_file: UploadFile = File(...),  # noqa: B008
+    audio_file: Optional[UploadFile] = File(None, description="Audio file to analyze"),
+    audio_url: Optional[str] = Query(None, description="URL to download audio file from"),
     encode: bool = Query(default=True, description="Encode audio first through FFmpeg"),
 ):
-    detected_lang_code, confidence = asr_model.language_detection(load_audio(audio_file.file, encode))
+    # Validate that either audio_file or audio_url is provided, but not both
+    if not audio_file and not audio_url:
+        raise HTTPException(
+            status_code=400, 
+            detail="Either audio_file or audio_url must be provided"
+        )
+    
+    if audio_file and audio_url:
+        raise HTTPException(
+            status_code=400, 
+            detail="Cannot provide both audio_file and audio_url. Choose one."
+        )
+    
+    # Handle audio input based on source
+    if audio_url:
+        try:
+            # Download audio from URL
+            downloaded_file = download_audio_from_url(audio_url)
+            audio_data = load_audio(downloaded_file, encode)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to process audio URL: {str(e)}")
+        finally:
+            # Clean up temporary file if it exists
+            if 'downloaded_file' in locals():
+                try:
+                    downloaded_file.close()
+                    import os
+                    os.unlink(downloaded_file.name)
+                except:
+                    pass
+    else:
+        # Handle uploaded file
+        audio_data = load_audio(audio_file.file, encode)
+
+    detected_lang_code, confidence = asr_model.language_detection(audio_data)
     return {
         "detected_language": tokenizer.LANGUAGES[detected_lang_code],
         "language_code": detected_lang_code,
@@ -136,7 +207,7 @@ async def detect_language(
     default=9000,
     help="Port for the webservice (default: 9000)",
 )
-@click.version_option(version=projectMetadata["Version"])
+@click.version_option(version="0.0.0")
 def start(host: str, port: Optional[int] = None):
     uvicorn.run(app, host=host, port=port)
 
