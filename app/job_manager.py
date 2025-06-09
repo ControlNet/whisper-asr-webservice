@@ -36,6 +36,7 @@ class JobManager:
         self,
         audio_file: Optional[BinaryIO] = None,
         audio_url: Optional[str] = None,
+        audio_id: Optional[str] = None,
         filename: Optional[str] = None,
         encode: bool = True,
         task: str = "transcribe",
@@ -50,13 +51,22 @@ class JobManager:
         """Submit a job for processing and return job ID."""
         job_id = str(uuid.uuid4())
         
+        # Generate cache key based on priority: audio_id > URL > file hash
+        if audio_id:
+            # Priority 1: Use provided audio_id
+            cache_key = audio_id
+            print(f"🔑 DEBUG Using audio_id as cache key: {audio_id}")
+        elif audio_url:
+            # Priority 2: Use URL + encode for cache key
+            cache_key = f"{audio_url}_{encode}"
+            print(f"🔑 DEBUG Using URL as cache key: {cache_key}")
+        else:
+            # Priority 3: Will use file hash (calculated below)
+            cache_key = None
+            print(f"🔑 DEBUG Will use file hash as cache key")
+        
         # Handle audio input - for URLs, we'll download in background
         if audio_url:
-            # For URLs, create a temporary hash based on URL and parameters
-            # We'll download and process in the background job
-            import hashlib
-            url_content = f"{audio_url}_{encode}".encode()
-            audio_hash = hashlib.sha256(url_content).hexdigest()
             audio_data = None
             if not filename:
                 ext = audio_url.split('.')[-1].split("?")[0]
@@ -67,8 +77,10 @@ class JobManager:
             audio_file.seek(0)  # Reset file pointer
             if not filename:
                 filename = getattr(audio_file, 'filename', 'uploaded_audio')
-            # Generate hash for uploaded file
-            audio_hash = db.generate_audio_hash(audio_data)
+            # For uploaded files without audio_id, use file hash as cache key
+            if not cache_key:
+                cache_key = db.generate_audio_hash(audio_data)
+                print(f"🔑 DEBUG Generated file hash as cache key: {cache_key}")
         
         # Prepare parameters for processing
         parameters = {
@@ -82,31 +94,62 @@ class JobManager:
             "output": output,
             "encode": encode,
             "filename": filename,
-            "audio_url": audio_url  # Store URL for background downloading
+            "audio_url": audio_url,  # Store URL for background downloading
+            "audio_id": audio_id  # Store audio_id for reference
         }
         
-        parameters_hash = db.generate_parameters_hash(parameters)
+        # Create cache parameters (exclude non-essential params that shouldn't affect caching)
+        cache_parameters = {
+            "job_type": job_type,
+            "task": task,
+            "language": language,
+            "initial_prompt": initial_prompt,
+            "vad_filter": vad_filter,
+            "word_timestamps": word_timestamps,
+            "diarize_options": diarize_options or {},
+            "output": output,
+            "encode": encode
+            # Exclude: filename, audio_url, audio_id - these don't affect processing results
+        }
         
-        # Check cache first (only for uploaded files where we have audio data)
-        if audio_data is not None:
-            cached_result = db.get_cached_subtitle(audio_hash, parameters_hash)
-            if cached_result:
-                self.logger.info(f"Cache hit for job {job_id}")
-                # Create job entry but mark as completed immediately
-                db.create_job(job_id, audio_hash, parameters)
-                db.update_job_status(job_id, "completed", cached_result)
-                return job_id
+        parameters_hash = db.generate_parameters_hash(cache_parameters)
+        
+        # Debug logging
+        print(f"🔍 DEBUG Job {job_id} - Cache key: {cache_key}")
+        print(f"🔍 DEBUG Job {job_id} - Parameters hash: {parameters_hash}")
+        print(f"🔍 DEBUG Job {job_id} - Cache parameters: {cache_parameters}")
+        
+        # Show current cache entries for debugging
+        cursor = db.connection.cursor()
+        cursor.execute("SELECT cache_key, parameters_hash FROM subtitle_cache WHERE cache_key = ?", (cache_key,))
+        existing_entries = cursor.fetchall()
+        if existing_entries:
+            print(f"📋 DEBUG Existing cache entries for key '{cache_key}': {[(row[0], row[1]) for row in existing_entries]}")
+        else:
+            print(f"📋 DEBUG No existing cache entries for key '{cache_key}'")
+        
+        # Check cache first with the determined cache key
+        cached_result = db.get_cached_subtitle(cache_key, parameters_hash)
+        if cached_result:
+            print(f"✅ DEBUG Cache HIT for job {job_id} with cache key: {cache_key}")
+            # Create job entry but mark as completed immediately
+            db.create_job(job_id, cache_key, parameters)
+            db.update_job_status(job_id, "completed", cached_result)
+            return job_id
+        else:
+            print(f"❌ DEBUG Cache MISS for job {job_id} with cache key: {cache_key}")
+            print(f"🔄 DEBUG Will process and cache result...")
         
         # Store audio data temporarily for processing (encode as base64 for JSON storage)
         if audio_data is not None:
             parameters["audio_data"] = base64.b64encode(audio_data).decode('utf-8')
         else:
             parameters["audio_data"] = None  # Will download in background
-        parameters["audio_hash"] = audio_hash
+        parameters["cache_key"] = cache_key
         parameters["parameters_hash"] = parameters_hash
         
         # Create job entry
-        db.create_job(job_id, audio_hash, parameters)
+        db.create_job(job_id, cache_key, parameters)
         
         self.logger.info(f"Job {job_id} submitted for processing")
         return job_id
@@ -122,7 +165,7 @@ class JobManager:
                 # Get pending jobs
                 cursor = db.connection.cursor()
                 cursor.execute("""
-                    SELECT id, audio_hash, parameters 
+                    SELECT id, cache_key, parameters 
                     FROM jobs 
                     WHERE status = 'pending' 
                     ORDER BY created_at ASC 
@@ -171,7 +214,8 @@ class JobManager:
             # Extract parameters
             audio_data_b64 = parameters.get("audio_data")
             audio_url = parameters.get("audio_url")
-            audio_hash = parameters.get("audio_hash")
+            audio_id = parameters.get("audio_id")
+            cache_key = parameters.get("cache_key")
             parameters_hash = parameters.get("parameters_hash")
             encode = parameters.get("encode", True)
             
@@ -190,18 +234,18 @@ class JobManager:
                 import os
                 os.unlink(downloaded_file.name)
                 
-                # Update audio hash with actual file content for proper caching
-                actual_audio_hash = db.generate_audio_hash(audio_data)
+                # If no audio_id was provided, update cache key with actual file hash for better caching
+                if not audio_id:
+                    actual_file_hash = db.generate_audio_hash(audio_data)
+                    # Check cache again with actual file hash
+                    cached_result = db.get_cached_subtitle(actual_file_hash, parameters_hash)
+                    if cached_result:
+                        self.logger.info(f"Cache hit after download for job {job_id} with file hash")
+                        db.update_job_status(job_id, "completed", cached_result)
+                        return cached_result
+                    # Update cache key to file hash for this session
+                    cache_key = actual_file_hash
                 
-                # Check cache again with actual audio hash
-                cached_result = db.get_cached_subtitle(actual_audio_hash, parameters_hash)
-                if cached_result:
-                    self.logger.info(f"Cache hit after download for job {job_id}")
-                    db.update_job_status(job_id, "completed", cached_result)
-                    return cached_result
-                
-                # Update the audio hash for this job
-                audio_hash = actual_audio_hash
                 audio_file_obj = io.BytesIO(audio_data)
             else:
                 raise ValueError("No audio data or URL found in job parameters")
@@ -240,7 +284,8 @@ class JobManager:
                     result_text += chunk
             
             # Cache the result
-            db.cache_subtitle(audio_hash, parameters_hash, result_text)
+            print(f"💾 DEBUG Caching result for job {job_id} with cache key: {cache_key}, params hash: {parameters_hash}")
+            db.cache_subtitle(cache_key, parameters_hash, result_text)
             
             # Update job status
             db.update_job_status(job_id, "completed", result_text)

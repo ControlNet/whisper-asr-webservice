@@ -10,14 +10,20 @@ from pathlib import Path
 class Database:
     """SQLite database manager for job tracking and subtitle caching."""
     
-    def __init__(self, db_path: str = "whisper_cache.db"):
+    def __init__(self, db_path: str = None):
         """Initialize database connection and create tables if they don't exist."""
-        # Create database directory if it doesn't exist
-        db_dir = Path(db_path).parent
-        if db_dir != Path("."):
-            db_dir.mkdir(parents=True, exist_ok=True)
+        if db_path is None:
+            # Use the standard whisper cache directory
+            cache_dir = Path.home() / ".cache" / "whisper"
+            db_path = cache_dir / "api_cache.sqlite"
+        else:
+            db_path = Path(db_path)
         
-        self.db_path = db_path
+        # Create database directory if it doesn't exist
+        db_dir = db_path.parent
+        db_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.db_path = str(db_path)
         self._local = threading.local()
         self._init_db()
     
@@ -32,6 +38,18 @@ class Database:
     def _init_db(self):
         """Initialize database tables."""
         with sqlite3.connect(self.db_path) as conn:
+            # Check if we need to migrate from old schema
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(jobs)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'audio_hash' in columns and 'cache_key' not in columns:
+                # Migrate from old schema
+                print("Migrating database schema from audio_hash to cache_key...")
+                conn.execute("ALTER TABLE jobs RENAME COLUMN audio_hash TO cache_key")
+                conn.execute("ALTER TABLE subtitle_cache RENAME COLUMN audio_hash TO cache_key")
+                print("Database migration completed.")
+            
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
@@ -39,7 +57,7 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     started_at TIMESTAMP NULL,
                     completed_at TIMESTAMP NULL,
-                    audio_hash TEXT NOT NULL,
+                    cache_key TEXT NOT NULL,
                     parameters TEXT NOT NULL,
                     result TEXT NULL,
                     error TEXT NULL
@@ -49,20 +67,20 @@ class Database:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS subtitle_cache (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    audio_hash TEXT NOT NULL,
+                    cache_key TEXT NOT NULL,
                     parameters_hash TEXT NOT NULL,
                     result TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     access_count INTEGER DEFAULT 1,
                     last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(audio_hash, parameters_hash)
+                    UNIQUE(cache_key, parameters_hash)
                 )
             """)
             
             # Create indices for better performance
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_hash ON subtitle_cache(audio_hash, parameters_hash)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_hash ON subtitle_cache(cache_key, parameters_hash)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_accessed ON subtitle_cache(last_accessed)")
             
             conn.commit()
@@ -77,13 +95,13 @@ class Database:
         sorted_params = json.dumps(parameters, sort_keys=True)
         return hashlib.sha256(sorted_params.encode()).hexdigest()
     
-    def create_job(self, job_id: str, audio_hash: str, parameters: Dict) -> None:
+    def create_job(self, job_id: str, cache_key: str, parameters: Dict) -> None:
         """Create a new job entry."""
         cursor = self.connection.cursor()
         cursor.execute("""
-            INSERT INTO jobs (id, status, audio_hash, parameters)
+            INSERT INTO jobs (id, status, cache_key, parameters)
             VALUES (?, ?, ?, ?)
-        """, (job_id, "pending", audio_hash, json.dumps(parameters)))
+        """, (job_id, "pending", cache_key, json.dumps(parameters)))
         self.connection.commit()
     
     def update_job_status(self, job_id: str, status: str, result: Optional[str] = None, error: Optional[str] = None) -> None:
@@ -133,33 +151,33 @@ class Database:
             }
         return None
     
-    def get_cached_subtitle(self, audio_hash: str, parameters_hash: str) -> Optional[str]:
+    def get_cached_subtitle(self, cache_key: str, parameters_hash: str) -> Optional[str]:
         """Get cached subtitle result."""
         cursor = self.connection.cursor()
         cursor.execute("""
             UPDATE subtitle_cache 
             SET access_count = access_count + 1, last_accessed = CURRENT_TIMESTAMP
-            WHERE audio_hash = ? AND parameters_hash = ?
-        """, (audio_hash, parameters_hash))
+            WHERE cache_key = ? AND parameters_hash = ?
+        """, (cache_key, parameters_hash))
         
         cursor.execute("""
             SELECT result FROM subtitle_cache 
-            WHERE audio_hash = ? AND parameters_hash = ?
-        """, (audio_hash, parameters_hash))
+            WHERE cache_key = ? AND parameters_hash = ?
+        """, (cache_key, parameters_hash))
         
         row = cursor.fetchone()
         self.connection.commit()
         
         return row["result"] if row else None
     
-    def cache_subtitle(self, audio_hash: str, parameters_hash: str, result: str) -> None:
+    def cache_subtitle(self, cache_key: str, parameters_hash: str, result: str) -> None:
         """Cache subtitle result."""
         cursor = self.connection.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO subtitle_cache 
-            (audio_hash, parameters_hash, result)
+            (cache_key, parameters_hash, result)
             VALUES (?, ?, ?)
-        """, (audio_hash, parameters_hash, result))
+        """, (cache_key, parameters_hash, result))
         self.connection.commit()
     
     def cleanup_old_jobs(self, days_old: int = 7) -> int:

@@ -2,6 +2,7 @@ import os
 from os import path
 from typing import Annotated, Optional, Union
 from urllib.parse import quote
+from contextlib import asynccontextmanager
 
 import click
 import uvicorn
@@ -17,6 +18,15 @@ from app.database import db
 
 LANGUAGE_CODES = sorted(tokenizer.LANGUAGES.keys())
 
+
+# Use lifespan events instead of deprecated on_event
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    yield
+    # Shutdown
+    job_manager.shutdown()
+    db.close()
 
 async def wait_for_job_completion(job_id: str, max_wait_time: int = 300) -> str:
     """Asynchronously wait for job completion and return result."""
@@ -45,6 +55,7 @@ app = FastAPI(
     contact={"url": "https://github.com/ControlNet/whisper-asr-webservice"},
     swagger_ui_parameters={"defaultModelsExpandDepth": -1},
     license_info={"name": "MIT License", "url": "https://github.com/ControlNet/whisper-asr-webservice/blob/main/LICENSE"},
+    lifespan=lifespan,
 )
 
 assets_path = os.getcwd() + "/swagger-ui-assets"
@@ -63,13 +74,6 @@ if path.exists(assets_path + "/swagger-ui.css") and path.exists(assets_path + "/
     applications.get_swagger_ui_html = swagger_monkey_patch
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean shutdown of background services."""
-    job_manager.shutdown()
-    db.close()
-
-
 @app.get("/", response_class=RedirectResponse, include_in_schema=False)
 async def index():
     return "/docs"
@@ -79,6 +83,7 @@ async def index():
 async def asr(
     audio_file: Optional[UploadFile] = File(None, description="Audio file to transcribe"),
     audio_url: Optional[str] = Query(None, description="URL to download audio file from"),
+    audio_id: Optional[str] = Query(None, description="Optional audio ID for caching (overrides URL/file hash)"),
     encode: bool = Query(default=True, description="Encode audio first through ffmpeg"),
     task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
     language: Union[str, None] = Query(default=None, enum=LANGUAGE_CODES),
@@ -130,6 +135,7 @@ async def asr(
         job_id = job_manager.submit_job(
             audio_file=audio_file.file if audio_file else None,
             audio_url=audio_url,
+            audio_id=audio_id,
             filename=audio_file.filename if audio_file else None,
             encode=encode,
             task=task,
@@ -171,6 +177,7 @@ async def asr(
 async def detect_language(
     audio_file: Optional[UploadFile] = File(None, description="Audio file to analyze"),
     audio_url: Optional[str] = Query(None, description="URL to download audio file from"),
+    audio_id: Optional[str] = Query(None, description="Optional audio ID for caching (overrides URL/file hash)"),
     encode: bool = Query(default=True, description="Encode audio first through FFmpeg"),
 ):
     # Validate that either audio_file or audio_url is provided, but not both
@@ -191,6 +198,7 @@ async def detect_language(
         job_id = job_manager.submit_job(
             audio_file=audio_file.file if audio_file else None,
             audio_url=audio_url,
+            audio_id=audio_id,
             encode=encode,
             job_type="detect_language"
         )
@@ -210,6 +218,7 @@ async def detect_language(
 async def submit_job(
     audio_file: Optional[UploadFile] = File(None, description="Audio file to transcribe"),
     audio_url: Optional[str] = Query(None, description="URL to download audio file from"),
+    audio_id: Optional[str] = Query(None, description="Optional audio ID for caching (overrides URL/file hash)"),
     encode: bool = Query(default=True, description="Encode audio first through ffmpeg"),
     task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
     language: Union[str, None] = Query(default=None, enum=LANGUAGE_CODES),
@@ -262,6 +271,7 @@ async def submit_job(
         job_id = job_manager.submit_job(
             audio_file=audio_file.file if audio_file else None,
             audio_url=audio_url,
+            audio_id=audio_id,
             filename=audio_file.filename if audio_file else None,
             encode=encode,
             task=task,
@@ -273,13 +283,37 @@ async def submit_job(
             output=output
         )
         
-        return JSONResponse(
-            content={
-                "job_id": job_id,
-                "status": "submitted"
-            },
-            status_code=202
-        )
+        # Check if job was completed immediately (cache hit)
+        job_status = job_manager.get_job_status(job_id)
+        if job_status and job_status["status"] == "completed":
+            # Cache hit - return result directly
+            return JSONResponse(
+                content={
+                    "job_id": job_id,
+                    "status": "completed",
+                    "result": job_status["result"],
+                    "created_at": job_status["created_at"],
+                    "started_at": job_status["started_at"], 
+                    "completed_at": job_status["completed_at"],
+                    "message": "Cache hit - result returned immediately",
+                    "cached": True
+                },
+                status_code=200
+            )
+        else:
+            # Job queued for processing
+            return JSONResponse(
+                content={
+                    "job_id": job_id,
+                    "status": "submitted",
+                    "created_at": job_status["created_at"] if job_status else None,
+                    "started_at": job_status["started_at"] if job_status else None,
+                    "completed_at": job_status["completed_at"] if job_status else None,
+                    "message": "Job submitted successfully. Use the /get endpoint to check status and retrieve results.",
+                    "cached": False
+                },
+                status_code=202
+            )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to submit job: {str(e)}")
