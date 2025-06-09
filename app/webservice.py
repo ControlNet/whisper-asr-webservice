@@ -7,18 +7,36 @@ import click
 import uvicorn
 from fastapi import FastAPI, File, Query, UploadFile, applications, HTTPException
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from whisper import tokenizer
 
 from app.config import CONFIG
-from app.factory.asr_model_factory import ASRModelFactory
-from app.utils import load_audio, download_audio_from_url
-
-asr_model = ASRModelFactory.create_asr_model()
-asr_model.load_model()
+from app.job_manager import job_manager
+from app.database import db
 
 LANGUAGE_CODES = sorted(tokenizer.LANGUAGES.keys())
+
+
+async def wait_for_job_completion(job_id: str, max_wait_time: int = 300) -> str:
+    """Asynchronously wait for job completion and return result."""
+    import asyncio
+    
+    start_time = asyncio.get_event_loop().time()
+    
+    while (asyncio.get_event_loop().time() - start_time) < max_wait_time:
+        job_status = job_manager.get_job_status(job_id)
+        
+        if job_status["status"] == "completed":
+            return job_status["result"]
+        elif job_status["status"] == "failed":
+            raise RuntimeError(f"Job failed: {job_status.get('error', 'Unknown error')}")
+        
+        # Non-blocking async sleep
+        await asyncio.sleep(0.5)
+    
+    raise TimeoutError("Job processing timed out")
+
 
 app = FastAPI(
     title="Whisper ASR Webservice",
@@ -43,6 +61,13 @@ if path.exists(assets_path + "/swagger-ui.css") and path.exists(assets_path + "/
         )
 
     applications.get_swagger_ui_html = swagger_monkey_patch
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean shutdown of background services."""
+    job_manager.shutdown()
+    db.close()
 
 
 @app.get("/", response_class=RedirectResponse, include_in_schema=False)
@@ -100,48 +125,46 @@ async def asr(
             detail="Cannot provide both audio_file and audio_url. Choose one."
         )
     
-    # Handle audio input based on source
-    if audio_url:
-        try:
-            # Download audio from URL
-            downloaded_file = download_audio_from_url(audio_url)
-            audio_data = load_audio(downloaded_file, encode)
-            # Extract filename from URL for response headers
+    try:
+        # Submit job to job manager
+        job_id = job_manager.submit_job(
+            audio_file=audio_file.file if audio_file else None,
+            audio_url=audio_url,
+            filename=audio_file.filename if audio_file else None,
+            encode=encode,
+            task=task,
+            language=language if language != "auto" else None,
+            initial_prompt=initial_prompt,
+            vad_filter=vad_filter,
+            word_timestamps=word_timestamps,
+            diarize_options={"diarize": diarize, "min_speakers": min_speakers, "max_speakers": max_speakers},
+            output=output,
+            job_type="transcribe"
+        )
+        
+        # Wait for completion asynchronously
+        result = await wait_for_job_completion(job_id)
+        
+        # Extract filename for response headers
+        if audio_url:
             filename = audio_url.split('/')[-1] or "downloaded_audio"
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to process audio URL: {str(e)}")
-        finally:
-            # Clean up temporary file if it exists
-            if 'downloaded_file' in locals():
-                try:
-                    downloaded_file.close()
-                    import os
-                    os.unlink(downloaded_file.name)
-                except:
-                    pass
-    else:
-        # Handle uploaded file
-        audio_data = load_audio(audio_file.file, encode)
-        filename = audio_file.filename
-
-    result = asr_model.transcribe(
-        audio_data,
-        task,
-        language if language != "auto" else None,
-        initial_prompt,
-        vad_filter,
-        word_timestamps,
-        {"diarize": diarize, "min_speakers": min_speakers, "max_speakers": max_speakers},
-        output,
-    )
-    return StreamingResponse(
-        result,
-        media_type="text/plain",
-        headers={
-            "Asr-Engine": CONFIG.ASR_ENGINE,
-            "Content-Disposition": f'attachment; filename="{quote(filename)}.{output}"',
-        },
-    )
+        else:
+            filename = audio_file.filename
+        
+        # Return result as streaming response
+        def generate():
+            yield result
+        
+        return StreamingResponse(
+            generate(),
+            media_type="text/plain",
+            headers={
+                "Asr-Engine": CONFIG.ASR_ENGINE,
+                "Content-Disposition": f'attachment; filename="{quote(filename)}.{output}"',
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 
 @app.post("/detect-language", tags=["Endpoints"])
@@ -163,33 +186,153 @@ async def detect_language(
             detail="Cannot provide both audio_file and audio_url. Choose one."
         )
     
-    # Handle audio input based on source
-    if audio_url:
-        try:
-            # Download audio from URL
-            downloaded_file = download_audio_from_url(audio_url)
-            audio_data = load_audio(downloaded_file, encode)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to process audio URL: {str(e)}")
-        finally:
-            # Clean up temporary file if it exists
-            if 'downloaded_file' in locals():
-                try:
-                    downloaded_file.close()
-                    import os
-                    os.unlink(downloaded_file.name)
-                except:
-                    pass
-    else:
-        # Handle uploaded file
-        audio_data = load_audio(audio_file.file, encode)
+    try:
+        # Submit language detection job to job manager
+        job_id = job_manager.submit_job(
+            audio_file=audio_file.file if audio_file else None,
+            audio_url=audio_url,
+            encode=encode,
+            job_type="detect_language"
+        )
+        
+        # Wait for completion asynchronously
+        result = await wait_for_job_completion(job_id)
+        
+        # Parse and return the JSON result
+        import json
+        return json.loads(result)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Language detection failed: {str(e)}")
 
-    detected_lang_code, confidence = asr_model.language_detection(audio_data)
-    return {
-        "detected_language": tokenizer.LANGUAGES[detected_lang_code],
-        "language_code": detected_lang_code,
-        "confidence": confidence,
+
+@app.post("/submit", tags=["Async Endpoints"])
+async def submit_job(
+    audio_file: Optional[UploadFile] = File(None, description="Audio file to transcribe"),
+    audio_url: Optional[str] = Query(None, description="URL to download audio file from"),
+    encode: bool = Query(default=True, description="Encode audio first through ffmpeg"),
+    task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
+    language: Union[str, None] = Query(default=None, enum=LANGUAGE_CODES),
+    initial_prompt: Union[str, None] = Query(default=None),
+    vad_filter: Annotated[
+        bool | None,
+        Query(
+            description="Enable the voice activity detection (VAD) to filter out parts of the audio without speech",
+            include_in_schema=(True if CONFIG.ASR_ENGINE == "faster_whisper" else False),
+        ),
+    ] = False,
+    word_timestamps: bool = Query(
+        default=False,
+        description="Word level timestamps",
+        include_in_schema=(True if CONFIG.ASR_ENGINE == "faster_whisper" else False),
+    ),
+    diarize: bool = Query(
+        default=False,
+        description="Diarize the input",
+        include_in_schema=(True if CONFIG.ASR_ENGINE == "whisperx" and CONFIG.HF_TOKEN != "" else False),
+    ),
+    min_speakers: Union[int, None] = Query(
+        default=None,
+        description="Min speakers in this file",
+        include_in_schema=(True if CONFIG.ASR_ENGINE == "whisperx" else False),
+    ),
+    max_speakers: Union[int, None] = Query(
+        default=None,
+        description="Max speakers in this file",
+        include_in_schema=(True if CONFIG.ASR_ENGINE == "whisperx" else False),
+    ),
+    output: Union[str, None] = Query(default="txt", enum=["txt", "vtt", "srt", "tsv", "json"]),
+):
+    """Submit an ASR job for background processing. Returns a job ID that can be used to check status and retrieve results."""
+    # Validate that either audio_file or audio_url is provided, but not both
+    if not audio_file and not audio_url:
+        raise HTTPException(
+            status_code=400, 
+            detail="Either audio_file or audio_url must be provided"
+        )
+    
+    if audio_file and audio_url:
+        raise HTTPException(
+            status_code=400, 
+            detail="Cannot provide both audio_file and audio_url. Choose one."
+        )
+    
+    try:
+        # Submit job to job manager
+        job_id = job_manager.submit_job(
+            audio_file=audio_file.file if audio_file else None,
+            audio_url=audio_url,
+            filename=audio_file.filename if audio_file else None,
+            encode=encode,
+            task=task,
+            language=language if language != "auto" else None,
+            initial_prompt=initial_prompt,
+            vad_filter=vad_filter,
+            word_timestamps=word_timestamps,
+            diarize_options={"diarize": diarize, "min_speakers": min_speakers, "max_speakers": max_speakers},
+            output=output
+        )
+        
+        return JSONResponse(
+            content={
+                "job_id": job_id,
+                "status": "submitted"
+            },
+            status_code=202
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to submit job: {str(e)}")
+
+
+@app.get("/get/{job_id}", tags=["Async Endpoints"])
+async def get_job_result(job_id: str):
+    """Get the status and result of a submitted job."""
+    job = job_manager.get_job_status(job_id)
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    response_data = {
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "completed_at": job["completed_at"]
     }
+    
+    if job["status"] == "completed":
+        response_data["result"] = job["result"]
+        return JSONResponse(content=response_data, status_code=200)
+    elif job["status"] == "failed":
+        response_data["error"] = job["error"]
+        return JSONResponse(content=response_data, status_code=200)
+    elif job["status"] == "processing":
+        response_data["message"] = "Job is currently being processed"
+        return JSONResponse(content=response_data, status_code=202)
+    else:  # pending
+        response_data["message"] = "Job is queued for processing"
+        return JSONResponse(content=response_data, status_code=202)
+
+
+@app.get("/stats", tags=["Admin"])
+async def get_system_stats():
+    """Get system statistics including cache hits, job queue status, etc."""
+    stats = job_manager.get_stats()
+    return JSONResponse(content=stats)
+
+
+@app.post("/admin/cleanup", tags=["Admin"])
+async def cleanup_old_data(
+    job_days: int = Query(default=7, description="Delete jobs older than this many days"),
+    cache_days: int = Query(default=30, description="Delete cache entries older than this many days")
+):
+    """Clean up old jobs and cache entries."""
+    result = job_manager.cleanup_old_data(job_days, cache_days)
+    return JSONResponse(content={
+        "message": "Cleanup completed",
+        **result
+    })
 
 
 @click.command()
